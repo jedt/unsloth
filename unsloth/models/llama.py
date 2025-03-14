@@ -23,6 +23,10 @@ from ._utils import __version__
 from torch.nn.functional import scaled_dot_product_attention
 from transformers import __version__ as transformers_version
 from unsloth_zoo.utils import Version, _get_dtype
+from functools import partial
+from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
+from transformers_cfg.generation.logits_process import GrammarConstrainedLogitsProcessor
+
 transformers_version = Version(transformers_version)
 # Transformers moved rotary embeddings out of all attention layers
 IS_ATTENTION_REFACTOR = transformers_version > Version("4.47.1")
@@ -76,6 +80,43 @@ pass
 from triton import __version__ as triton_version
 HAS_XFORMERS = xformers is not None
 BlockDiagonalCausalMask = xformers.attn_bias.BlockDiagonalCausalMask if HAS_XFORMERS else None
+
+JSON_ARR_GBNF = r"""
+# This is the same as json.gbnf but we restrict whitespaces at the end of the root array
+# Useful for generating JSON arrays
+
+root   ::= arr
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+arr  ::=
+  "[\n" ws (
+            value
+    (",\n" ws value)*
+  )? "]"
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\"" (
+    [^"\\\x7F\x00-\x1F] |
+    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes
+  )* "\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
+
+# Optional space: by convention, applied in this grammar after literal chars when allowed
+ws ::= ([ \t\n] ws)?
+"""
 
 
 def original_apply_qkv(self, X):
@@ -320,6 +361,29 @@ def fast_rms_layernorm_inference(self, X, XX = None, XX2 = None, variance = None
     X *= self.weight
     return X
 pass
+
+def generate_with_grammar(model, input_ids, **kwargs):
+    tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
+    grammar = IncrementalGrammarConstraint(JSON_ARR_GBNF, start_rule_name="root", tokenizer=tokenizer)
+    grammar_processor = GrammarConstrainedLogitsProcessor(grammar)
+
+    partial_generate = partial(
+        model.generate,
+        do_sample=False,
+        repetition_penalty=1.1,
+        num_return_sequences=1,
+        logits_processor=[grammar_processor],  # Ensure grammar_processor is accessible
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        sliding_window=None,
+    )
+
+    # Execute generation with merged parameters
+    return partial_generate(
+        input_ids=input_ids,
+        **kwargs
+    )
 
 
 def fast_rms_layernorm_inference_gemma(self, X, out_weight = None):
