@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2025.3.10"
+__version__ = "2025.3.18"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -72,6 +72,7 @@ from platform import system as platform_system
 platform_system = platform_system()
 import numpy as np
 import contextlib
+import re
 import warnings, subprocess, re, inspect, psutil, os, math
 from unsloth_zoo.utils import Version
 
@@ -181,6 +182,43 @@ try:
 except:
     pass
 
+# Gemma3 It is strongly recommended to train Gemma3 models with the `eager`
+try:
+    from transformers.models.gemma3.modeling_gemma3 import logger as gemma3_logger
+    gemma3_logger.addFilter(HideLoggingMessage("strongly recommended"))
+    del gemma3_logger
+except:
+    pass
+
+
+# Patch get_model_param_count to record correct 4bit / 8bit
+from transformers.trainer_pt_utils import is_deepspeed_zero3_enabled
+def get_model_param_count(model, trainable_only = False):
+    """
+    Calculate model's total param count. If trainable_only is True then count only those requiring grads
+    """
+    if is_deepspeed_zero3_enabled():
+        def numel(p):
+            return p.ds_numel if hasattr(p, "ds_numel") else p.numel()
+    else:
+        def numel(p):
+            return p.numel()
+    s = sum(numel(p) for p in model.parameters() if not trainable_only or p.requires_grad)
+    if (not trainable_only) and \
+        hasattr(model, "config") and \
+        hasattr(model.config, "quantization_config"):
+
+        billions = re.findall(r"([0-9]{1,})(?:b|B)", model.config.name_or_path)
+        if len(billions) != 0:
+            billions = int(billions[0])
+            s = 1_000_000_000 * billions
+    pass
+    return s
+pass
+import transformers.trainer_pt_utils
+transformers.trainer_pt_utils.get_model_param_count = get_model_param_count
+import transformers.trainer
+transformers.trainer.get_model_param_count = get_model_param_count
 # =============================================
 
 # =============================================
@@ -446,7 +484,8 @@ pass
 import transformers.generation.configuration_utils
 if hasattr(transformers.generation.configuration_utils, "ALL_CACHE_IMPLEMENTATIONS"):
     if type(transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS) is list:
-        transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS.append("dynamic")
+        if "dynamic" not in transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS:
+            transformers.generation.configuration_utils.ALL_CACHE_IMPLEMENTATIONS.append("dynamic")
     pass
 pass
 # =============================================
@@ -987,13 +1026,7 @@ def _unsloth_pre_compute_loss(self, model, inputs, *args, **kwargs):
             "Read more on gradient accumulation issues here: https://unsloth.ai/blog/gradient"
         )
     pass
-
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
-        autocaster = contextlib.nullcontext()
-    else:
-        autocaster = torch.autocast(device_type = "cuda", dtype = torch.float32)
-    with autocaster:
-        outputs = self._old_compute_loss(model, inputs, *args, **kwargs)
+    outputs = self._old_compute_loss(model, inputs, *args, **kwargs)
     return outputs
 pass
 
@@ -1097,7 +1130,9 @@ pass
 
 
 def unsloth_compile_transformers(
+    dtype,
     model_name,
+    model_types,
     token                   = None,
     revision                = None,
     trust_remote_code       = False,
@@ -1135,17 +1170,15 @@ def unsloth_compile_transformers(
         )
         return
     pass
-
-    model_types = get_transformers_model_type(
-        model_name        = model_name,
-        token             = token,
-        revision          = revision,
-        trust_remote_code = trust_remote_code,
-    )
-    model_types = ["siglip"] + model_types
-
+    if trust_remote_code:
+        print(
+            "Unsloth: We can't trace models if `trust_remote_code = True`, "\
+            "so turning off some optimizations!"
+        )
+        return
     if disable: return
 
+    model_types = list(dict().fromkeys(model_types).keys())
     for model_type in model_types:
         _unsloth_compile_transformers(
             model_type,
@@ -1175,6 +1208,9 @@ def unsloth_compile_transformers(
             return_logits          = return_logits,
         )
     pass
+    # Redo patches which override compiler
+    for temporary_patch in TEMPORARY_PATCHES:
+        temporary_patch()
     return model_types
 pass
 
@@ -1207,6 +1243,7 @@ for j, function in enumerate(functions):
         except: continue
 pass
 
+import importlib
 USE_MODELSCOPE = os.environ.get("UNSLOTH_USE_MODELSCOPE", "0") == "1"
 if USE_MODELSCOPE:
     if importlib.util.find_spec("modelscope") is None:
