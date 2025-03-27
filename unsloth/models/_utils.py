@@ -67,6 +67,10 @@ __all__ = [
 ]
 
 import torch
+if torch.cuda.is_available():
+    is_available_cuda = True
+else:
+    is_available_cuda = False
 from typing import Union, Optional, List, Any, Callable, Tuple
 from platform import system as platform_system
 platform_system = platform_system()
@@ -278,14 +282,20 @@ pass
 
 # =============================================
 # torch.cuda.amp.custom_fwd is deprecated >= 2.4
-torch_version = torch.__version__
-if Version(torch_version) < Version("2.4.0"):
-    torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
-    torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
+if is_available_cuda:
+    torch_version = torch.__version__
+    if Version(torch_version) < Version("2.4.0"):
+        torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
+        torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
+    else:
+        torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
+        torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    pass
 else:
-    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
-    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    torch_amp_custom_fwd = None
+    torch_amp_custom_bwd = None
 pass
+
 # =============================================
 
 # =============================================
@@ -322,7 +332,7 @@ if is_openai_available():
         def _is_openai_available(): return False
         transformers.utils.is_openai_available = _is_openai_available
     pass
-pass 
+pass
 
 # =============================================
 # Get Flash Attention v2 if Ampere (RTX 30xx, A100)
@@ -330,55 +340,61 @@ import bitsandbytes as bnb
 from transformers import AutoTokenizer
 from transformers.utils.import_utils import _is_package_available
 
-major_version, minor_version = torch.cuda.get_device_capability()
-SUPPORTS_BFLOAT16 = False
-HAS_FLASH_ATTENTION = False
-HAS_FLASH_ATTENTION_SOFTCAPPING = False
-
-if major_version >= 8:
-    SUPPORTS_BFLOAT16 = True
-    if _is_package_available("flash_attn"):
-        # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl"
-        try:
-            try:
-                # See https://github.com/unslothai/unsloth/issues/1437
-                from flash_attn.flash_attn_interface import flash_attn_gpu
-            except:
-                from flash_attn.flash_attn_interface import flash_attn_cuda
-            HAS_FLASH_ATTENTION = True
-
-            # Also check for softcapping
-            from flash_attn import __version__ as flash_attn_version
-            HAS_FLASH_ATTENTION_SOFTCAPPING = Version(flash_attn_version) >= Version("2.6.3")
-            if not HAS_FLASH_ATTENTION_SOFTCAPPING:
-                print(
-                    "Unsloth: If you want to finetune Gemma 2, upgrade flash-attn to version 2.6.3 or higher!\n"\
-                    "Newer versions support faster and less memory usage kernels for Gemma 2's attention softcapping!\n"\
-                    "To update flash-attn, do the below:\n"\
-                    '\npip install --no-deps --upgrade "flash-attn>=2.6.3"'
-                )
-        except:
-            print(
-                "Unsloth: Your Flash Attention 2 installation seems to be broken?\n"\
-                "A possible explanation is you have a new CUDA version which isn't\n"\
-                "yet compatible with FA2? Please file a ticket to Unsloth or FA2.\n"\
-                "We shall now use Xformers instead, which does not have any performance hits!\n"\
-                "We found this negligible impact by benchmarking on 1x A100."
-            )
-
-            # Stop Flash Attention from importing!
-            import transformers.utils.import_utils
-            transformers.utils.import_utils.is_flash_attn_2_available = lambda *args, **kwargs: False
-            import transformers.utils
-            transformers.utils.is_flash_attn_2_available = lambda *args, **kwargs: False
-
-            HAS_FLASH_ATTENTION = False
-        pass
-    else:
-        HAS_FLASH_ATTENTION = False
-else:
-    # Tri Dao's benchmark shows xformers is faster for now.
+if is_available_cuda:
+    major_version, minor_version = torch.cuda.get_device_capability()
+    SUPPORTS_BFLOAT16 = False
     HAS_FLASH_ATTENTION = False
+    HAS_FLASH_ATTENTION_SOFTCAPPING = False
+
+    if major_version >= 8:
+        SUPPORTS_BFLOAT16 = True
+        if _is_package_available("flash_attn"):
+            # Check for CUDA linking errors "undefined symbol: _ZNK3c106SymIntltEl"
+            try:
+                try:
+                    # See https://github.com/unslothai/unsloth/issues/1437
+                    from flash_attn.flash_attn_interface import flash_attn_gpu
+                except:
+                    from flash_attn.flash_attn_interface import flash_attn_cuda
+                HAS_FLASH_ATTENTION = True
+
+                # Also check for softcapping
+                from flash_attn import __version__ as flash_attn_version
+                HAS_FLASH_ATTENTION_SOFTCAPPING = Version(flash_attn_version) >= Version("2.6.3")
+                if not HAS_FLASH_ATTENTION_SOFTCAPPING:
+                    print(
+                        "Unsloth: If you want to finetune Gemma 2, upgrade flash-attn to version 2.6.3 or higher!\n"\
+                        "Newer versions support faster and less memory usage kernels for Gemma 2's attention softcapping!\n"\
+                        "To update flash-attn, do the below:\n"\
+                        '\npip install --no-deps --upgrade "flash-attn>=2.6.3"'
+                    )
+            except:
+                print(
+                    "Unsloth: Your Flash Attention 2 installation seems to be broken?\n"\
+                    "A possible explanation is you have a new CUDA version which isn't\n"\
+                    "yet compatible with FA2? Please file a ticket to Unsloth or FA2.\n"\
+                    "We shall now use Xformers instead, which does not have any performance hits!\n"\
+                    "We found this negligible impact by benchmarking on 1x A100."
+                )
+
+                # Stop Flash Attention from importing!
+                import transformers.utils.import_utils
+                transformers.utils.import_utils.is_flash_attn_2_available = lambda *args, **kwargs: False
+                import transformers.utils
+                transformers.utils.is_flash_attn_2_available = lambda *args, **kwargs: False
+
+                HAS_FLASH_ATTENTION = False
+            pass
+        else:
+            HAS_FLASH_ATTENTION = False
+    else:
+        # Tri Dao's benchmark shows xformers is faster for now.
+        HAS_FLASH_ATTENTION = False
+    pass
+else:
+    SUPPORTS_BFLOAT16 = False
+    HAS_FLASH_ATTENTION = False
+    HAS_FLASH_ATTENTION_SOFTCAPPING = False
 pass
 
 from transformers.models.llama.modeling_llama import logger
@@ -1032,7 +1048,7 @@ pass
 
 
 def patch_gradient_accumulation_fix(Trainer):
-    # Fixes gradient accumulation 
+    # Fixes gradient accumulation
     import inspect
     if hasattr(Trainer, "get_batch_samples"):
         if Trainer.get_batch_samples.__name__ == "_unsloth_get_batch_samples": return
@@ -1106,10 +1122,10 @@ def patch_gradient_accumulation_fix(Trainer):
         "\2if num_items_in_batch is None:\n"\
         "\3loss = loss / self.args.gradient_accumulation_steps\n"\
         "\1self.accelerator.backward(loss, **kwargs)",
-        
+
         function,
     )
-    
+
     exec(function, globals())
     Trainer.training_step = _unsloth_training_step
 pass
