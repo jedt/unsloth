@@ -39,6 +39,7 @@ if __name__ == "__main__":
             )
         ], return_tensors="pt").to(device)
 
+    torch.compile(model)
     with torch.no_grad():
         streamer = TextStreamer(tokenizer)
 

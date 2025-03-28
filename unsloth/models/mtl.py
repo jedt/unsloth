@@ -15,7 +15,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
 from transformers.modeling_utils import sdpa_attention_forward, flash_attention_forward
 from peft import PeftConfig, PeftModel
-
+from cut_cross_entropy import linear_cross_entropy
 
 from transformers import __version__ as transformers_version
 transformers_version = Version(transformers_version)
@@ -27,6 +27,7 @@ from huggingface_hub.utils import get_token
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb, eager_attention_forward
 from transformers.cache_utils import Cache
+from transformers.utils import LossKwargs
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 SUPPORTS_FOURBIT = transformers_version >= Version("4.37")
@@ -86,6 +87,12 @@ from unsloth_zoo.tokenizer_utils import (
     patch_tokenizer as _patch_tokenizer,
 )
 
+torch_square = torch.square
+torch_mean   = torch.mean
+torch_mv     = torch.mv
+torch_matmul = torch.matmul
+torch_mm     = torch.mm
+
 def patch_tokenizer(model, tokenizer):
     model, tokenizer = _patch_tokenizer(model, tokenizer)
     if model is not None:
@@ -93,11 +100,32 @@ def patch_tokenizer(model, tokenizer):
     return model, tokenizer
 pass
 
-torch_square = torch.square
-torch_mean   = torch.mean
-torch_mv     = torch.mv
-torch_matmul = torch.matmul
-torch_mm     = torch.mm
+def fused_linear_cross_entropy(
+    hidden_states      : torch.Tensor,
+    lm_weight          : torch.Tensor,
+    labels             : torch.Tensor,
+    num_items_in_batch : int = None,
+    ignore_index       : int = -100,
+    reduction          : str = "mean",
+    logit_softcapping  : float = 0,
+    accuracy_threshold : str = "auto",
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    if logit_softcapping == 0: logit_softcapping = None
+    loss = linear_cross_entropy(
+        hidden_states.to(lm_weight.dtype),
+        lm_weight,
+        targets      = labels,
+        ignore_index = ignore_index,
+        softcap      = logit_softcapping,
+        reduction    = reduction,
+        shift        = True,
+        filter_eps   = accuracy_threshold,
+    )
+    if num_items_in_batch is not None: loss = loss / num_items_in_batch
+    return loss
+pass
 
 class FastMTLLlamaModel(AutoModelForCausalLM):
     @staticmethod
@@ -288,11 +316,118 @@ def FastMTLQwen2Attention_forward(
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+
+def LLamaForCausalLM_forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+            logits_to_keep (`int` or `torch.Tensor`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+
+        >>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
+
+        loss = None
+        if labels is not None:
+            # loss = self.loss_function(
+            #     logits=logits,
+            #     labels=labels,
+            #     vocab_size=self.config.vocab_size, **kwargs
+            # )
+            n_items = kwargs.get("num_items_in_batch", None) or kwargs.get("n_items", None)
+            loss = fused_linear_cross_entropy(
+                hidden_states      = hidden_states,
+                lm_weight          = self.lm_head,
+                labels             = labels,
+                num_items_in_batch = n_items,
+                logit_softcapping  = logit_softcapping,
+            )
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
 
 class FastMTLQwen2Model(FastMTLLlamaModel):
     @staticmethod
     def pre_patch():
         Qwen2Attention      .forward = FastMTLQwen2Attention_forward
+        Qwen2ForCausalLM    .forward = LLamaForCausalLM_forward
         import transformers.models.qwen2.modeling_qwen2
         transformers.models.qwen2.modeling_qwen2.Qwen2RotaryEmbedding = LlamaRotaryEmbedding
     pass
