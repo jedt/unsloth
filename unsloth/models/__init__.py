@@ -13,7 +13,7 @@
 # limitations under the License.
 import torch
 if torch.backends.mps.is_available():
-    from .mtl  import FastMTLQwen2Model
+    from .mtl  import FastMTLQwen2Model, FastMTLQwen2Attention_forward, LLamaForCausalLM_forward
 else:
     from .llama   import FastLlamaModel
     from .loader  import FastLanguageModel, FastVisionModel, FastTextModel, FastModel
