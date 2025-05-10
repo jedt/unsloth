@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .llama     import FastLlamaModel
+from .llama     import FastLlamaModel, generate_with_grammar
 from .loader    import FastLanguageModel, FastVisionModel, FastTextModel, FastModel
 from .mistral   import FastMistralModel
 from .qwen2     import FastQwen2Model
