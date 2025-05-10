@@ -1639,6 +1639,8 @@ def unsloth_fast_generate(
         model_eos_token_id = model_eos_token_id[0]
 
     kwargs["pad_token_id"] = kwargs.pop("pad_token_id", model_eos_token_id)
+    kwargs.pop("num_logits_to_keep", None)
+    kwargs.pop("sliding_window", None)
 
     # Mixed precision autocast
     with torch.inference_mode(), torch.autocast(device_type = "cuda", dtype = dtype):
